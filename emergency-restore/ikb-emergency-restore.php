@@ -84,6 +84,20 @@ if ( $is_cli ) {
 	}
 	header( 'Content-Type: text/html; charset=utf-8' );
 	header( 'X-Robots-Tag: noindex, nofollow' );
+	header( 'Referrer-Policy: no-referrer' );
+
+	// Mutating requests must be same-origin. The token already gates access;
+	// this rejects cross-site form posts that carry a leaked token.
+	if ( 'POST' === ( $_SERVER['REQUEST_METHOD'] ?? '' ) ) {
+		$origin  = isset( $_SERVER['HTTP_ORIGIN'] ) ? (string) $_SERVER['HTTP_ORIGIN'] : ( isset( $_SERVER['HTTP_REFERER'] ) ? (string) $_SERVER['HTTP_REFERER'] : '' );
+		$o_host  = $origin ? strtolower( (string) parse_url( $origin, PHP_URL_HOST ) ) : '';
+		$my_host = strtolower( (string) parse_url( '//' . ( $_SERVER['HTTP_HOST'] ?? '' ), PHP_URL_HOST ) );
+		if ( '' !== $o_host && '' !== $my_host && $o_host !== $my_host ) {
+			http_response_code( 403 );
+			exit( 'Forbidden (cross-origin)' );
+		}
+	}
+
 	echo '<!doctype html><title>IK Backup emergency restore</title><h1>IK Backup emergency restore</h1>';
 
 	$db_only = ! empty( $_POST['db_only'] );
@@ -201,7 +215,22 @@ if ( ! $manifest_json || ! $sql ) {
 	exit( 1 );
 }
 $manifest = json_decode( $manifest_json, true );
-ikb_er_out( 'Backup: ' . basename( $zip_path ) . ' from ' . ( $manifest['created_gmt'] ?? 'unknown date' ) . ' (site ' . ( $manifest['site_url'] ?? '?' ) . ')' );
+if ( ! is_array( $manifest ) || empty( $manifest['format'] ) || 'ik-backup/1' !== $manifest['format'] ) {
+	ikb_er_out( 'ERROR: unsupported or missing backup manifest' );
+	$zip->close();
+	exit( 1 );
+}
+if ( empty( $manifest['db_sha256'] ) || ! hash_equals( (string) $manifest['db_sha256'], hash( 'sha256', $sql ) ) ) {
+	ikb_er_out( 'ERROR: database dump checksum does not match the manifest; the archive is corrupt or tampered with. Nothing was changed.' );
+	$zip->close();
+	exit( 1 );
+}
+if ( false === strpos( $sql, 'CREATE TABLE' ) ) {
+	ikb_er_out( 'ERROR: database dump contains no CREATE TABLE statements; refusing to restore' );
+	$zip->close();
+	exit( 1 );
+}
+ikb_er_out( 'Backup: ' . basename( $zip_path ) . ' from ' . ( $manifest['created_gmt'] ?? 'unknown date' ) . ' (site ' . ( $manifest['site_url'] ?? '?' ) . '), integrity verified' );
 
 // --- Restore files ---------------------------------------------------------
 $tmp = sys_get_temp_dir() . '/ikb-er-' . getmypid() . '-' . substr( md5( uniqid() ), 0, 6 );

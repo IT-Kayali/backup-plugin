@@ -3,7 +3,7 @@
  * Plugin Name:       IK Backup
  * Plugin URI:        https://github.com/IT-Kayali/backup-plugin
  * Description:       Manual and scheduled full backups (database + wp-content) stored outside the web root, in-admin restore, and an emergency restore script that works when wp-admin is unreachable. This plugin does not replace hosting-level or off-server backups.
- * Version:           0.2.0
+ * Version:           0.2.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            IT-Kayali
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'IKB_VERSION', '0.2.0' );
+define( 'IKB_VERSION', '0.2.1' );
 define( 'IKB_PLUGIN_FILE', __FILE__ );
 define( 'IKB_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -138,16 +138,25 @@ function ikb_storage_probe_passes( $dir = null ) {
 	$upload = wp_upload_dir();
 	$url    = str_replace( $upload['basedir'], $upload['baseurl'], $dir ) . '/' . $probe;
 
-	$passes  = false;
-	$response = wp_remote_get( $url, array( 'timeout' => 10, 'sslverify' => false ) );
-	if ( is_wp_error( $response ) ) {
-		// Unreachable cannot prove safety either way; treat as not exposed only
-		// when the site URL itself is local (dev), otherwise fail closed.
-		$passes = false;
-	} else {
-		$code = wp_remote_retrieve_response_code( $response );
-		$body = wp_remote_retrieve_body( $response );
-		$passes = ! ( 200 === $code && false !== strpos( (string) $body, $secret ) );
+	// Fail closed: only a verified denial counts. A definitive 401/403/404/410
+	// response without the probe body proves the file is not served. Anything
+	// else - network error, timeout, redirect, soft-404, 5xx, a 200 without the
+	// body - is inconclusive and therefore unsafe.
+	$passes   = false;
+	$response = wp_remote_get(
+		$url,
+		array(
+			'timeout'     => 10,
+			'sslverify'   => false,
+			'redirection' => 0,
+		)
+	);
+	if ( ! is_wp_error( $response ) ) {
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		$body = (string) wp_remote_retrieve_body( $response );
+		if ( in_array( $code, array( 401, 403, 404, 410 ), true ) && false === strpos( $body, $secret ) ) {
+			$passes = true;
+		}
 	}
 
 	// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink

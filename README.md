@@ -10,6 +10,18 @@ A small WordPress backup plugin: full database dump plus `wp-content` archive, s
 - **Scheduled backups** via WP-Cron (daily or weekly) with retention (keeps the newest N backups).
 - Backup manifest (`manifest.json` in every archive): creation date, site URL, WordPress/PHP/MySQL versions, table prefix, table/row counts, SHA-256 of the database dump.
 
+## What is (not) in a backup
+
+A backup archive contains:
+
+- `db.sql` - a full dump of every table in the WordPress database
+- `wp-content/` - plugins, themes, uploads, and everything else under `wp-content`
+- `manifest.json` - metadata plus the SHA-256 checksum of `db.sql`
+
+A backup does **not** contain `wp-config.php`, WordPress core files (`wp-admin`, `wp-includes`, root PHP files), `.htaccess`, or anything else outside `wp-content`. Restores therefore never touch core files or your database credentials; on a broken install you restore core from a fresh WordPress download and this plugin restores content and data.
+
+Before any destructive step, every restore verifies the archive: supported manifest format, no path-traversal entries, and the `db.sql` checksum matching the manifest. A corrupt or tampered archive is rejected before anything is overwritten.
+
 ## Honest limits
 
 This plugin is **not** a disaster-recovery guarantee:

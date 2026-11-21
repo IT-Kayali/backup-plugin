@@ -46,6 +46,11 @@ class IKB_Restore {
 			return $safe;
 		}
 
+		$integrity = self::verify_db_integrity( $zip_path, $manifest );
+		if ( is_wp_error( $integrity ) ) {
+			return $integrity;
+		}
+
 		@set_time_limit( 0 ); // phpcs:ignore
 		wp_raise_memory_limit( 'ikb' );
 
@@ -127,6 +132,36 @@ class IKB_Restore {
 		}
 
 		return $stats;
+	}
+
+	/**
+	 * Verify the database dump against the manifest checksum before anything
+	 * destructive happens.
+	 *
+	 * @param string $zip_path Archive path.
+	 * @param array  $manifest Parsed manifest.
+	 * @return true|WP_Error
+	 */
+	public static function verify_db_integrity( $zip_path, $manifest ) {
+		$zip = new ZipArchive();
+		if ( true !== $zip->open( $zip_path ) ) {
+			return new WP_Error( 'ikb_zip_read', 'Could not open backup archive.' );
+		}
+		$sql = $zip->getFromName( 'db.sql' );
+		$zip->close();
+		if ( ! is_string( $sql ) || '' === $sql ) {
+			return new WP_Error( 'ikb_no_sql', 'Backup archive has no db.sql.' );
+		}
+		if ( empty( $manifest['db_sha256'] ) ) {
+			return new WP_Error( 'ikb_no_checksum', 'Backup manifest has no database checksum; refusing to restore an unverified dump.' );
+		}
+		if ( ! hash_equals( (string) $manifest['db_sha256'], hash( 'sha256', $sql ) ) ) {
+			return new WP_Error( 'ikb_checksum_mismatch', 'Database dump checksum does not match the manifest; the archive is corrupt or tampered with. Restore aborted before any change.' );
+		}
+		if ( false === strpos( $sql, 'CREATE TABLE' ) ) {
+			return new WP_Error( 'ikb_bad_sql', 'Database dump contains no CREATE TABLE statements; refusing to restore.' );
+		}
+		return true;
 	}
 
 	/**

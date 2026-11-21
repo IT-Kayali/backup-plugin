@@ -229,9 +229,9 @@ class IKB_Admin {
 		if ( ! $is_public ) {
 			echo 'Status: <strong style="color:green">outside the web root</strong> - backup files cannot be fetched over HTTP.</p>';
 		} elseif ( $probe_ok ) {
-			echo 'Status: <strong style="color:#996800">inside the web root, but a live probe could not fetch it over HTTP</strong> (server denies direct access). Consider setting <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root.</p>';
+			echo 'Status: <strong style="color:#996800">inside the web root; a live probe verified the server denies direct access</strong> (definitive 401/403/404/410). Consider setting <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root.</p>';
 		} else {
-			echo 'Status: <strong style="color:#b00">REACHABLE OVER HTTP - backup creation is refused.</strong> Set <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root (for example <code>' . esc_html( rtrim( dirname( ABSPATH ), '/' ) . '/.ik-backups' ) . '</code>) or fix the web server configuration.</p>';
+			echo 'Status: <strong style="color:#b00">REACHABLE OVER HTTP or the probe was inconclusive - backup creation is refused.</strong> The plugin only stores backups here when denial is verified. Set <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root (for example <code>' . esc_html( rtrim( dirname( ABSPATH ), '/' ) . '/.ik-backups' ) . '</code>) or fix the web server configuration.</p>';
 		}
 
 		echo '<p>Backups contain the full database and <code>wp-content</code>. They are stored on this server. Download copies regularly: a backup on the same server does not protect you from hosting or server failure.</p>';
