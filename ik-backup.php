@@ -3,7 +3,7 @@
  * Plugin Name:       IK Backup
  * Plugin URI:        https://github.com/IT-Kayali/backup-plugin
  * Description:       Manual and scheduled full backups (database + wp-content) stored outside the web root, in-admin restore, and an emergency restore script that works when wp-admin is unreachable. This plugin does not replace hosting-level or off-server backups.
- * Version:           0.3.0
+ * Version:           0.3.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            IT-Kayali
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'IKB_VERSION', '0.3.0' );
+define( 'IKB_VERSION', '0.3.1' );
 define( 'IKB_PLUGIN_FILE', __FILE__ );
 define( 'IKB_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 

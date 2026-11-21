@@ -24,7 +24,8 @@ class IKB_Admin {
 		add_action( 'admin_post_ikb_delete', array( __CLASS__, 'handle_delete' ) );
 		add_action( 'admin_post_ikb_download', array( __CLASS__, 'handle_download' ) );
 		add_action( 'admin_post_ikb_deploy_emergency', array( __CLASS__, 'handle_deploy_emergency' ) );
-		add_action( 'admin_post_ikb_test_swap', array( __CLASS__, 'handle_test_swap' ) );
+		add_action( 'admin_post_ikb_test_emergency', array( __CLASS__, 'handle_test_emergency' ) );
+        add_action( 'admin_post_ikb_test_swap', array( __CLASS__, 'handle_test_swap' ) );
 		add_action( 'admin_post_ikb_settings', array( __CLASS__, 'handle_settings' ) );
 		add_action( 'admin_notices', array( __CLASS__, 'notice' ) );
 	}
@@ -174,6 +175,27 @@ class IKB_Admin {
 		update_option( 'ikb_emergency_deployed', array( 'path' => $target, 'token' => $token ) );
 		self::back( 'deployed', home_url( '/ikb-emergency-restore.php' ) . ' (token stored below)' );
 	}
+
+    /** Exercise standalone verification without exposing its token or restoring anything. */
+    public static function handle_test_emergency() {
+        self::guard( 'ikb_test_emergency' );
+        $deployed = get_option( 'ikb_emergency_deployed', array() );
+        if ( empty( $deployed['token'] ) ) { self::back( 'error', 'Deploy the emergency script first.' ); }
+        $snapshot = null;
+        foreach ( IKB_Backup::list_backups() as $b ) {
+            $m = IKB_Backup::read_manifest( $b['path'] );
+            if ( ! is_wp_error( $m ) && 'translate-plugin' === ( $m['scope'] ?? '' ) ) { $snapshot = $b; break; }
+        }
+        if ( ! $snapshot ) { self::back( 'error', 'Create a Translate-plugin snapshot first.' ); }
+        $url = home_url( '/ikb-emergency-restore.php' );
+        $denied = wp_remote_get( $url, array( 'timeout' => 15, 'redirection' => 0 ) );
+        if ( is_wp_error( $denied ) || 403 !== wp_remote_retrieve_response_code( $denied ) ) { self::back( 'error', 'Unauthenticated recovery-endpoint check was inconclusive. Nothing restored.' ); }
+        $verified = wp_remote_post( $url, array( 'timeout' => 30, 'redirection' => 0, 'headers' => array( 'Origin' => home_url() ), 'body' => array( 'token' => $deployed['token'], 'backup' => $snapshot['file'], 'mode' => 'verify' ) ) );
+        if ( is_wp_error( $verified ) || 200 !== wp_remote_retrieve_response_code( $verified ) || false === strpos( wp_remote_retrieve_body( $verified ), 'VERIFIED:' ) || false === strpos( wp_remote_retrieve_body( $verified ), 'Scope: translate-plugin' ) || false === strpos( wp_remote_retrieve_body( $verified ), 'Plugin target writable: yes' ) ) {
+            self::back( 'error', 'Standalone verification did not pass. No live restore was attempted.' );
+        }
+        self::back( 'probe_ok', 'Standalone recovery HTTP verified: unauthenticated access denied, plugin snapshot checksums valid, target writable. No plugin files or database were restored.' );
+    }
 
     /** Test the same directory-swap route using disposable marker directories only. */
     public static function handle_test_swap() {
@@ -333,6 +355,12 @@ class IKB_Admin {
         echo '<input type="hidden" name="action" value="ikb_test_swap">';
         submit_button( 'Test plugin-directory swap route', 'secondary', 'submit', false );
         echo '<p>Creates and removes disposable marker directories. Does not change the Translate plugin, database, orders or settings.</p></form>';
+
+        echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+        wp_nonce_field( 'ikb_test_emergency' );
+        echo '<input type="hidden" name="action" value="ikb_test_emergency">';
+        submit_button( 'Verify standalone recovery, no restore', 'secondary', 'submit', false );
+        echo '<p>Checks denied access without a token and runs the standalone script in verify-only mode against the latest Translate snapshot. Does not restore anything or reveal the token.</p></form>';
 
 		// Settings.
 		echo '<h2>Settings</h2>';
