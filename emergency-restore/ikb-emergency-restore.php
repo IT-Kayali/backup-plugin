@@ -7,16 +7,28 @@
  * the whole site is broken but PHP still runs (browser mode) or you have
  * command-line access (CLI mode).
  *
- * CLI:     php ikb-emergency-restore.php <backup-file.zip> [--wp-root=/path]
+ * CLI:     php ikb-emergency-restore.php <backup-file.zip> [--wp-root=/path] [--db-only] [--yes]
  * Browser: https://example.com/ikb-emergency-restore.php?token=TOKEN
- *          then pick a backup and confirm.
+ *          then pick a backup and type RESTORE to confirm.
  *
  * Limits:  this script cannot help when the web server or PHP itself is
  *          down, or when the server storage is lost. Keep off-server copies.
+ *          A restore overwrites the whole database, including orders and
+ *          users created after the backup was taken.
  */
 
 define( 'IKB_ER_TOKEN', '%%IKB_TOKEN%%' );
 define( 'IKB_ER_BACKUP_DIR', '%%IKB_BACKUP_DIR%%' );
+
+/**
+ * Minimal esc_html for standalone use.
+ *
+ * @param string $s Input.
+ * @return string
+ */
+function ikb_er_esc( $s ) {
+	return htmlspecialchars( (string) $s, ENT_QUOTES, 'UTF-8' );
+}
 
 /**
  * Send a plain-text/HTML line depending on mode.
@@ -27,24 +39,16 @@ function ikb_er_out( $msg ) {
 	if ( 'cli' === PHP_SAPI ) {
 		echo $msg . "\n";
 	} else {
-		echo esc_html( $msg ) . "<br>\n";
+		echo ikb_er_esc( $msg ) . "<br>\n";
 		flush();
 	}
 }
 
-/**
- * Minimal esc_html for standalone use.
- *
- * @param string $s Input.
- * @return string
- */
-function esc_html( $s ) {
-	return htmlspecialchars( (string) $s, ENT_QUOTES, 'UTF-8' );
-}
-
 set_time_limit( 0 ); // phpcs:ignore
 
-$is_cli = ( 'cli' === PHP_SAPI );
+$is_cli  = ( 'cli' === PHP_SAPI );
+$db_only = false;
+$assume_yes = false;
 
 // --- Locate WordPress root and backup -------------------------------------
 $wp_root = __DIR__;
@@ -56,12 +60,16 @@ if ( $is_cli ) {
 	foreach ( $args as $arg ) {
 		if ( 0 === strpos( $arg, '--wp-root=' ) ) {
 			$wp_root = rtrim( substr( $arg, 10 ), '/' );
+		} elseif ( '--db-only' === $arg ) {
+			$db_only = true;
+		} elseif ( '--yes' === $arg ) {
+			$assume_yes = true;
 		} elseif ( '' === $backup ) {
 			$backup = $arg;
 		}
 	}
 	if ( '' === $backup ) {
-		echo "Usage: php ikb-emergency-restore.php <backup-file.zip> [--wp-root=/path]\n";
+		echo "Usage: php ikb-emergency-restore.php <backup-file.zip> [--wp-root=/path] [--db-only] [--yes]\n";
 		echo "Backups in " . IKB_ER_BACKUP_DIR . ":\n";
 		foreach ( glob( IKB_ER_BACKUP_DIR . '/ikb-backup-*.zip' ) ?: array() as $f ) {
 			echo '  ' . basename( $f ) . "\n";
@@ -69,29 +77,41 @@ if ( $is_cli ) {
 		exit( 1 );
 	}
 } else {
-	$token = isset( $_REQUEST['token'] ) ? $_REQUEST['token'] : '';
-	if ( ! hash_equals( IKB_ER_TOKEN, (string) $token ) || '%%IKB' . 'TOKEN%%' === IKB_ER_TOKEN ) {
+	$token = isset( $_POST['token'] ) ? $_POST['token'] : ( isset( $_GET['token'] ) ? $_GET['token'] : '' );
+	if ( ! is_string( $token ) || ! hash_equals( IKB_ER_TOKEN, $token ) || false !== strpos( IKB_ER_TOKEN, '%IKB_' ) ) {
 		http_response_code( 403 );
 		exit( 'Forbidden' );
 	}
 	header( 'Content-Type: text/html; charset=utf-8' );
+	header( 'X-Robots-Tag: noindex, nofollow' );
 	echo '<!doctype html><title>IK Backup emergency restore</title><h1>IK Backup emergency restore</h1>';
 
-	if ( isset( $_REQUEST['backup'] ) ) {
-		$backup = basename( (string) $_REQUEST['backup'] );
-	} else {
-		echo '<form method="post"><input type="hidden" name="token" value="' . esc_html( $token ) . '">';
-		echo '<select name="backup">';
-		foreach ( glob( IKB_ER_BACKUP_DIR . '/ikb-backup-*.zip' ) ?: array() as $f ) {
-			echo '<option value="' . esc_html( basename( $f ) ) . '">' . esc_html( basename( $f ) . ' (' . round( filesize( $f ) / 1048576, 1 ) . ' MB)' ) . '</option>';
+	$db_only = ! empty( $_POST['db_only'] );
+	if ( isset( $_POST['backup'] ) ) {
+		$backup = basename( (string) $_POST['backup'] );
+		// Typed confirmation: the word RESTORE must be entered.
+		$confirm = isset( $_POST['confirm'] ) ? (string) $_POST['confirm'] : '';
+		if ( 'RESTORE' !== $confirm ) {
+			echo '<p><strong>Confirmation missing.</strong> Type RESTORE to confirm.</p>';
+			$backup = '';
 		}
-		echo '</select> ';
-		echo '<button type="submit" onclick="return confirm(\'Restore this backup? Database and files will be overwritten.\')">Restore now</button></form>';
+	}
+	if ( '' === $backup ) {
+		echo '<p style="color:#b00"><strong>Warning:</strong> a restore overwrites files and the whole database, including orders and users created after the backup was taken.</p>';
+		echo '<form method="post"><input type="hidden" name="token" value="' . ikb_er_esc( $token ) . '">';
+		echo '<p>Backup: <select name="backup">';
+		foreach ( glob( IKB_ER_BACKUP_DIR . '/ikb-backup-*.zip' ) ?: array() as $f ) {
+			echo '<option value="' . ikb_er_esc( basename( $f ) ) . '">' . ikb_er_esc( basename( $f ) . ' (' . round( filesize( $f ) / 1048576, 1 ) . ' MB)' ) . '</option>';
+		}
+		echo '</select></p>';
+		echo '<p><label><input type="checkbox" name="db_only" value="1"> database only (keep current files)</label></p>';
+		echo '<p>Type RESTORE to confirm: <input type="text" name="confirm" autocomplete="off"> ';
+		echo '<button type="submit">Restore now</button></p></form>';
 		exit;
 	}
 }
 
-// Resolve the archive path safely.
+// Resolve the archive path safely (basename only, no traversal).
 $zip_path = IKB_ER_BACKUP_DIR . '/' . basename( $backup );
 if ( ! is_readable( $zip_path ) ) {
 	// Also allow a full path in CLI mode.
@@ -103,10 +123,22 @@ if ( ! is_readable( $zip_path ) ) {
 	}
 }
 
+// CLI confirmation.
+if ( $is_cli && ! $assume_yes ) {
+	echo "About to restore " . basename( $zip_path ) . " over " . $wp_root . ( $db_only ? ' (database only)' : ' (files + database)' ) . ".\n";
+	echo "This OVERWRITES the database, including orders and users created after the backup.\n";
+	echo "Type RESTORE to continue: ";
+	$line = trim( (string) fgets( STDIN ) );
+	if ( 'RESTORE' !== $line ) {
+		echo "Aborted.\n";
+		exit( 1 );
+	}
+}
+
 // --- Read wp-config.php for DB credentials --------------------------------
 $config_file = $wp_root . '/wp-config.php';
 if ( ! is_readable( $config_file ) ) {
-	ikb_er_out( 'ERROR: wp-config.php not found at ' . $config_file );
+	ikb_er_out( 'ERROR: wp-config.php not found at the WordPress root' );
 	exit( 1 );
 }
 $config = file_get_contents( $config_file ); // phpcs:ignore
@@ -147,11 +179,19 @@ if ( preg_match( '/^([^:]+):(\d+)$/', $db_host, $m ) ) {
 	$sock = $m[2];
 }
 
-// --- Open archive ----------------------------------------------------------
+// --- Open and validate archive ---------------------------------------------
 $zip = new ZipArchive();
 if ( true !== $zip->open( $zip_path ) ) {
 	ikb_er_out( 'ERROR: could not open archive' );
 	exit( 1 );
+}
+for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+	$name = $zip->getNameIndex( $i );
+	if ( preg_match( '#(^|[/\\\\])\.\.([/\\\\]|$)#', $name ) || preg_match( '#^([/\\\\]|[a-zA-Z]:[/\\\\])#', $name ) ) {
+		ikb_er_out( 'ERROR: archive contains unsafe paths and was rejected: ' . $name );
+		$zip->close();
+		exit( 1 );
+	}
 }
 $manifest_json = $zip->getFromName( 'manifest.json' );
 $sql           = $zip->getFromName( 'db.sql' );
@@ -208,10 +248,10 @@ function ikb_er_copy( $src, $dst ) {
 }
 
 $copied = 0;
-if ( is_dir( $tmp . '/wp-content' ) ) {
+if ( ! $db_only && is_dir( $tmp . '/wp-content' ) ) {
 	$copied = ikb_er_copy( $tmp . '/wp-content', $wp_root . '/wp-content' );
 }
-ikb_er_out( 'Files restored: ' . $copied );
+ikb_er_out( 'Files restored: ' . $copied . ( $db_only ? ' (database-only mode)' : '' ) );
 
 // --- Restore database ------------------------------------------------------
 mysqli_report( MYSQLI_REPORT_OFF );
@@ -220,7 +260,7 @@ $ok = $sock
 	? mysqli_real_connect( $db, $host, $db_user, $db_pass, $db_name, null, $sock )
 	: mysqli_real_connect( $db, $host, $db_user, $db_pass, $db_name, $port );
 if ( ! $ok ) {
-	ikb_er_out( 'ERROR: database connection failed: ' . mysqli_connect_error() );
+	ikb_er_out( 'ERROR: database connection failed (check DB credentials in wp-config.php)' );
 	exit( 1 );
 }
 mysqli_set_charset( $db, 'utf8mb4' );
@@ -254,21 +294,11 @@ $current_url = '';
 if ( ! $is_cli ) {
 	$scheme      = ( ! empty( $_SERVER['HTTPS'] ) && 'off' !== $_SERVER['HTTPS'] ) ? 'https' : 'http';
 	$current_url = $scheme . '://' . $_SERVER['HTTP_HOST'];
-	if ( $current_url && isset( $manifest['site_url'] ) && untrailingslashit_local( $manifest['site_url'] ) !== untrailingslashit_local( $current_url ) ) {
-		$prefix = isset( $manifest['table_prefix'] ) ? $manifest['table_prefix'] : 'wp_';
+	if ( $current_url && isset( $manifest['site_url'] ) && rtrim( (string) $manifest['site_url'], '/' ) !== rtrim( $current_url, '/' ) ) {
+		$prefix = isset( $manifest['table_prefix'] ) && preg_match( '/^[A-Za-z0-9_]+$/', $manifest['table_prefix'] ) ? $manifest['table_prefix'] : 'wp_';
 		mysqli_query( $db, "UPDATE `{$prefix}options` SET option_value='" . mysqli_real_escape_string( $db, $current_url ) . "' WHERE option_name IN ('siteurl','home')" );
 		ikb_er_out( 'Adjusted siteurl/home to ' . $current_url );
 	}
-}
-
-/**
- * Local untrailingslashit.
- *
- * @param string $s URL.
- * @return string
- */
-function untrailingslashit_local( $s ) {
-	return rtrim( (string) $s, '/' );
 }
 
 // --- Cleanup ---------------------------------------------------------------
@@ -281,7 +311,7 @@ foreach ( $it as $file ) {
 }
 rmdir( $tmp ); // phpcs:ignore
 
-ikb_er_out( 'DONE. Restore complete. Log in and verify the site.' );
+ikb_er_out( 'DONE. Restore complete. Log in and verify the site. Consider rotating this script: redeploy it from the IK Backup admin page to get a new token.' );
 if ( ! $is_cli ) {
-	echo '<p><a href="' . esc_html( $current_url ) . '/wp-admin/">Go to wp-admin</a></p>';
+	echo '<p><a href="/wp-admin/">Go to wp-admin</a></p>';
 }

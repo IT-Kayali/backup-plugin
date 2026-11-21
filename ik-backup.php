@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       IK Backup
  * Plugin URI:        https://github.com/IT-Kayali/backup-plugin
- * Description:       Manual and scheduled full backups (database + wp-content) stored on the server, in-admin restore, and an emergency restore script that works when wp-admin is unreachable. This plugin does not replace hosting-level or off-server backups.
- * Version:           0.1.0
+ * Description:       Manual and scheduled full backups (database + wp-content) stored outside the web root, in-admin restore, and an emergency restore script that works when wp-admin is unreachable. This plugin does not replace hosting-level or off-server backups.
+ * Version:           0.2.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            IT-Kayali
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'IKB_VERSION', '0.1.0' );
+define( 'IKB_VERSION', '0.2.0' );
 define( 'IKB_PLUGIN_FILE', __FILE__ );
 define( 'IKB_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -25,26 +25,151 @@ require_once IKB_PLUGIN_DIR . 'includes/class-ikb-restore.php';
 require_once IKB_PLUGIN_DIR . 'includes/class-ikb-admin.php';
 
 /**
+ * Site-specific random path component, stable once generated.
+ *
+ * @return string
+ */
+function ikb_site_token() {
+	$token = get_option( 'ikb_site_token' );
+	if ( ! $token ) {
+		$token = wp_generate_password( 16, false, false );
+		update_option( 'ikb_site_token', $token, false );
+	}
+	return $token;
+}
+
+/**
  * Return the directory where backups are stored, creating it if needed.
+ *
+ * Storage is fail-closed: the first writable location outside the web root
+ * wins. Only if nothing outside the web root is writable does the plugin
+ * fall back to a protected, randomized directory under uploads - and even
+ * then, backups are refused unless a live probe proves the directory cannot
+ * be fetched over HTTP (see ikb_storage_is_safe()).
+ *
+ * A location can be forced with the IKB_BACKUP_DIR constant in wp-config.php.
  *
  * @return string Absolute path without trailing slash.
  */
 function ikb_backup_dir() {
-	$upload = wp_upload_dir();
-	$dir    = $upload['basedir'] . '/ik-backups';
-	if ( ! is_dir( $dir ) ) {
-		wp_mkdir_p( $dir );
+	static $dir = null;
+	if ( null !== $dir ) {
+		return $dir;
 	}
-	// Keep the backup directory out of direct web reach on Apache; downloads go through PHP.
+
+	$candidates = array();
+	if ( defined( 'IKB_BACKUP_DIR' ) && IKB_BACKUP_DIR ) {
+		$candidates[] = rtrim( IKB_BACKUP_DIR, '/' );
+	}
+	// Preferred: a hidden directory next to the WordPress root, not inside it.
+	$candidates[] = rtrim( dirname( ABSPATH ), '/' ) . '/.ik-backups-' . ikb_site_token();
+
+	$upload = wp_upload_dir();
+	// Fallback: randomized directory under uploads (requires the probe to pass).
+	$candidates[] = $upload['basedir'] . '/ik-backups-' . ikb_site_token();
+
+	foreach ( $candidates as $candidate ) {
+		if ( is_dir( $candidate ) || wp_mkdir_p( $candidate ) ) {
+			if ( is_writable( $candidate ) ) {
+				$dir = $candidate;
+				break;
+			}
+		}
+	}
+	if ( null === $dir ) {
+		// Last resort: report the preferred path; writes will fail loudly.
+		$dir = $candidates[0];
+	}
+
+	// Harmless hardening for any web server that does reach the directory.
 	if ( ! file_exists( $dir . '/.htaccess' ) ) {
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-		file_put_contents( $dir . '/.htaccess' , "Require all denied\nDeny from all\n" );
+		@file_put_contents( $dir . '/.htaccess', "Require all denied\nDeny from all\n" );
 	}
 	if ( ! file_exists( $dir . '/index.php' ) ) {
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
-		file_put_contents( $dir . '/index.php', "<?php\n// Silence is golden.\n" );
+		@file_put_contents( $dir . '/index.php', "<?php\n// Silence is golden.\n" );
 	}
 	return $dir;
+}
+
+/**
+ * Whether the backup directory sits inside the public web root.
+ *
+ * @param string|null $dir Optional directory; defaults to the active backup dir.
+ * @return bool
+ */
+function ikb_dir_is_public( $dir = null ) {
+	$dir  = $dir ? $dir : ikb_backup_dir();
+	$root = realpath( ABSPATH );
+	$real = realpath( $dir );
+	if ( ! $root || ! $real ) {
+		return true; // Unknown: assume public (fail closed).
+	}
+	return 0 === strpos( $real, rtrim( $root, '/' ) . '/' );
+}
+
+/**
+ * Probe whether the backup directory can be fetched over HTTP.
+ *
+ * Only relevant for directories inside the web root. Writes a random probe
+ * file and requests its public URL. The result is cached per directory.
+ *
+ * @param string|null $dir Optional directory; defaults to the active backup dir.
+ * @return bool True when the probe could NOT be fetched (storage not exposed).
+ */
+function ikb_storage_probe_passes( $dir = null ) {
+	$dir = $dir ? $dir : ikb_backup_dir();
+	if ( ! ikb_dir_is_public( $dir ) ) {
+		return true;
+	}
+
+	$cache_key = 'ikb_probe_' . md5( $dir );
+	$cached    = get_transient( $cache_key );
+	if ( false !== $cached ) {
+		return 'yes' === $cached;
+	}
+
+	$probe  = 'probe-' . wp_generate_password( 12, false, false ) . '.txt';
+	$secret = wp_generate_password( 24, false, false );
+	// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
+	@file_put_contents( $dir . '/' . $probe, $secret );
+
+	$upload = wp_upload_dir();
+	$url    = str_replace( $upload['basedir'], $upload['baseurl'], $dir ) . '/' . $probe;
+
+	$passes  = false;
+	$response = wp_remote_get( $url, array( 'timeout' => 10, 'sslverify' => false ) );
+	if ( is_wp_error( $response ) ) {
+		// Unreachable cannot prove safety either way; treat as not exposed only
+		// when the site URL itself is local (dev), otherwise fail closed.
+		$passes = false;
+	} else {
+		$code = wp_remote_retrieve_response_code( $response );
+		$body = wp_remote_retrieve_body( $response );
+		$passes = ! ( 200 === $code && false !== strpos( (string) $body, $secret ) );
+	}
+
+	// phpcs:ignore WordPress.WP.AlternativeFunctions.unlink_unlink
+	@unlink( $dir . '/' . $probe );
+	set_transient( $cache_key, $passes ? 'yes' : 'no', DAY_IN_SECONDS );
+	return $passes;
+}
+
+/**
+ * Fail-closed storage check used before writing any backup.
+ *
+ * @return bool
+ */
+function ikb_storage_is_safe() {
+	if ( defined( 'IKB_BACKUP_DIR' ) && IKB_BACKUP_DIR && ikb_dir_is_public() ) {
+		// An explicitly configured public directory must still pass the probe.
+		return ikb_storage_probe_passes();
+	}
+	if ( ! ikb_dir_is_public() ) {
+		return true;
+	}
+	return ikb_storage_probe_passes();
 }
 
 /**

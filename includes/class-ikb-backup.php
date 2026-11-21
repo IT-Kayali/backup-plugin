@@ -29,6 +29,13 @@ class IKB_Backup {
 
 		$args = wp_parse_args( $args, array( 'triggered_by' => 'manual' ) );
 
+		if ( ! ikb_storage_is_safe() ) {
+			return new WP_Error(
+				'ikb_storage_public',
+				'Backup storage is reachable over HTTP, so creating backups there is refused. Set IKB_BACKUP_DIR in wp-config.php to a directory outside the web root, or fix the web server configuration.'
+			);
+		}
+
 		@set_time_limit( 0 ); // phpcs:ignore
 		wp_raise_memory_limit( 'ikb' );
 

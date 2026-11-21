@@ -41,6 +41,11 @@ class IKB_Restore {
 			return $manifest;
 		}
 
+		$safe = self::validate_archive_paths( $zip_path );
+		if ( is_wp_error( $safe ) ) {
+			return $safe;
+		}
+
 		@set_time_limit( 0 ); // phpcs:ignore
 		wp_raise_memory_limit( 'ikb' );
 
@@ -122,6 +127,29 @@ class IKB_Restore {
 		}
 
 		return $stats;
+	}
+
+	/**
+	 * Reject archives whose entries would escape the extraction directory
+	 * (path traversal / absolute paths).
+	 *
+	 * @param string $zip_path Archive path.
+	 * @return true|WP_Error
+	 */
+	public static function validate_archive_paths( $zip_path ) {
+		$zip = new ZipArchive();
+		if ( true !== $zip->open( $zip_path ) ) {
+			return new WP_Error( 'ikb_zip_read', 'Could not open backup archive.' );
+		}
+		for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+			$name = $zip->getNameIndex( $i );
+			if ( preg_match( '#(^|[/\\\\])\\.\\.([/\\\\]|$)#', $name ) || preg_match( '#^([/\\\\]|[a-zA-Z]:[/\\\\])#', $name ) ) {
+				$zip->close();
+				return new WP_Error( 'ikb_unsafe_archive', 'Backup archive contains unsafe paths and was rejected: ' . esc_html( $name ) );
+			}
+		}
+		$zip->close();
+		return true;
 	}
 
 	/**

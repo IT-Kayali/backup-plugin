@@ -215,9 +215,26 @@ class IKB_Admin {
 		$deployed = get_option( 'ikb_emergency_deployed', array() );
 		$next_cron= wp_next_scheduled( 'ikb_run_scheduled_backup' );
 
+		$dir        = ikb_backup_dir();
+		$is_public  = ikb_dir_is_public( $dir );
+		$probe_ok   = ikb_storage_probe_passes( $dir );
+		$storage_ok = ikb_storage_is_safe();
+
 		echo '<div class="wrap">';
 		echo '<h1>IK Backup</h1>';
-		echo '<p>Backups contain the full database and <code>wp-content</code>. They are stored on this server in <code>' . esc_html( ikb_backup_dir() ) . '</code>. Download copies regularly: a backup on the same server does not protect you from hosting or server failure.</p>';
+
+		// Storage status.
+		echo '<h2>Storage</h2>';
+		echo '<p>Location: <code>' . esc_html( $dir ) . '</code><br>';
+		if ( ! $is_public ) {
+			echo 'Status: <strong style="color:green">outside the web root</strong> - backup files cannot be fetched over HTTP.</p>';
+		} elseif ( $probe_ok ) {
+			echo 'Status: <strong style="color:#996800">inside the web root, but a live probe could not fetch it over HTTP</strong> (server denies direct access). Consider setting <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root.</p>';
+		} else {
+			echo 'Status: <strong style="color:#b00">REACHABLE OVER HTTP - backup creation is refused.</strong> Set <code>IKB_BACKUP_DIR</code> in wp-config.php to a directory outside the web root (for example <code>' . esc_html( rtrim( dirname( ABSPATH ), '/' ) . '/.ik-backups' ) . '</code>) or fix the web server configuration.</p>';
+		}
+
+		echo '<p>Backups contain the full database and <code>wp-content</code>. They are stored on this server. Download copies regularly: a backup on the same server does not protect you from hosting or server failure.</p>';
 
 		// Create.
 		echo '<h2>Create backup</h2>';
@@ -229,6 +246,7 @@ class IKB_Admin {
 
 		// List.
 		echo '<h2>Backups (' . count( $backups ) . ')</h2>';
+		echo '<p><strong>Warning:</strong> restoring a backup overwrites the database, including orders and users created after the backup was taken. Use the safety backup option and restore promptly after an incident.</p>';
 		if ( empty( $backups ) ) {
 			echo '<p>No backups yet.</p>';
 		} else {
@@ -242,7 +260,7 @@ class IKB_Admin {
 
 				echo '<a class="button" href="' . esc_url( $download_url ) . '">Download</a> ';
 
-				echo '<form method="post" style="display:inline" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" onsubmit="return confirm(\'Restore this backup? The current database and files will be overwritten.\')">';
+				echo '<form method="post" style="display:inline" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" onsubmit="return confirm(\'Restore this backup? The database will be OVERWRITTEN, including orders and users created after this backup.\')">';
 				wp_nonce_field( 'ikb_restore' );
 				echo '<input type="hidden" name="action" value="ikb_restore"><input type="hidden" name="backup_file" value="' . esc_attr( $b['file'] ) . '">';
 				echo '<label><input type="checkbox" name="safety_backup" value="1" checked> safety backup first</label> ';
