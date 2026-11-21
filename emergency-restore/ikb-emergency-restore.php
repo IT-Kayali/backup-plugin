@@ -92,7 +92,7 @@ if ( $is_cli ) {
 		$origin  = isset( $_SERVER['HTTP_ORIGIN'] ) ? (string) $_SERVER['HTTP_ORIGIN'] : ( isset( $_SERVER['HTTP_REFERER'] ) ? (string) $_SERVER['HTTP_REFERER'] : '' );
 		$o_host  = $origin ? strtolower( (string) parse_url( $origin, PHP_URL_HOST ) ) : '';
 		$my_host = strtolower( (string) parse_url( '//' . ( $_SERVER['HTTP_HOST'] ?? '' ), PHP_URL_HOST ) );
-		if ( '' !== $o_host && '' !== $my_host && $o_host !== $my_host ) {
+		if ( '' === $o_host || '' === $my_host || $o_host !== $my_host ) {
 			http_response_code( 403 );
 			exit( 'Forbidden (cross-origin)' );
 		}
@@ -105,6 +105,7 @@ if ( $is_cli ) {
 		$backup = basename( (string) $_POST['backup'] );
 		// Typed confirmation: the word RESTORE must be entered.
 		$confirm = isset( $_POST['confirm'] ) ? (string) $_POST['confirm'] : '';
+        if ( 'verify' === ( $_POST['mode'] ?? '' ) ) { $confirm = 'RESTORE'; }
 		if ( 'RESTORE' !== $confirm ) {
 			echo '<p><strong>Confirmation missing.</strong> Type RESTORE to confirm.</p>';
 			$backup = '';
@@ -120,7 +121,8 @@ if ( $is_cli ) {
 		echo '</select></p>';
 		echo '<p><label><input type="checkbox" name="db_only" value="1"> database only (keep current files)</label></p>';
 		echo '<p>Type RESTORE to confirm: <input type="text" name="confirm" autocomplete="off"> ';
-		echo '<button type="submit">Restore now</button></p></form>';
+		echo '<button type="submit" name="mode" value="restore">Restore now</button> <button type="submit" name="mode" value="verify">Verify only, no writes</button></p></form>';
+        echo '<p>Translate-plugin snapshots restore only that plugin directory. Full archives overwrite files and the database. Verify only checks archive checksums and target readability without restoring.</p>';
 		exit;
 	}
 }
@@ -149,6 +151,61 @@ if ( $is_cli && ! $assume_yes ) {
 	}
 }
 
+
+// Verify all archive entries before opening the database or changing files.
+$pre = new ZipArchive();
+if ( true !== $pre->open( $zip_path, ZipArchive::CHECKCONS ) ) { ikb_er_out( 'ERROR: archive could not be opened' ); exit( 1 ); }
+$pm = json_decode( $pre->getFromName( 'manifest.json' ), true );
+$scope = $pm['scope'] ?? 'full';
+if ( ! is_array( $pm ) || 'ik-backup/1' !== ( $pm['format'] ?? '' ) || ! in_array( $scope, array( 'full', 'translate-plugin' ), true ) || empty( $pm['file_sha256'] ) ) { ikb_er_out( 'ERROR: verified file manifest is required' ); exit( 1 ); }
+$prefix = 'translate-plugin' === $scope ? 'wp-content/plugins/it-kayali-translate/' : 'wp-content/';
+for ( $i = 0; $i < $pre->numFiles; $i++ ) {
+    $name = $pre->getNameIndex( $i );
+    if ( preg_match( '#(^|[/\\])\.\.([/\\]|$)#', $name ) || preg_match( '#^([/\\]|[a-zA-Z]:)#', $name ) ) { ikb_er_out( 'ERROR: unsafe archive path' ); exit( 1 ); }
+    if ( 'manifest.json' === $name || ( 'full' === $scope && 'db.sql' === $name ) ) { continue; }
+    if ( 0 !== strpos( $name, $prefix ) || ! isset( $pm['file_sha256'][$name] ) ) { ikb_er_out( 'ERROR: unexpected archive entry' ); exit( 1 ); }
+}
+foreach ( $pm['file_sha256'] as $name => $hash ) {
+    $stream = $pre->getStream( $name );
+    if ( ! $stream ) { ikb_er_out( 'ERROR: backup file missing' ); exit( 1 ); }
+    $h = hash_init( 'sha256' ); hash_update_stream( $h, $stream ); fclose( $stream );
+    if ( ! is_string( $hash ) || ! hash_equals( $hash, hash_final( $h ) ) ) { ikb_er_out( 'ERROR: file checksum mismatch; nothing changed' ); exit( 1 ); }
+}
+if ( 'full' === $scope ) {
+    $stream = $pre->getStream( 'db.sql' );
+    if ( ! $stream || empty( $pm['db_sha256'] ) ) { ikb_er_out( 'ERROR: database checksum missing' ); exit( 1 ); }
+    $h = hash_init( 'sha256' ); hash_update_stream( $h, $stream ); fclose( $stream );
+    if ( ! hash_equals( (string) $pm['db_sha256'], hash_final( $h ) ) ) { ikb_er_out( 'ERROR: database checksum mismatch; nothing changed' ); exit( 1 ); }
+}
+$pre->close();
+if ( ! $is_cli && 'verify' === ( $_POST['mode'] ?? '' ) ) {
+    ikb_er_out( 'VERIFIED: archive checksums and scope are valid. No files or database were changed.' );
+    ikb_er_out( 'Scope: ' . $scope );
+    ikb_er_out( 'Plugin target writable: ' . ( is_writable( $wp_root . '/wp-content/plugins' ) ? 'yes' : 'no' ) );
+    exit;
+}
+$operation_lock = fopen( IKB_ER_BACKUP_DIR . '/operation.lock', 'c' );
+if ( ! $operation_lock || ! flock( $operation_lock, LOCK_EX | LOCK_NB ) ) { ikb_er_out( 'ERROR: another operation is running' ); exit( 1 ); }
+if ( 'translate-plugin' === $scope ) {
+    if ( ! isset( $pm['file_sha256']['wp-content/plugins/it-kayali-translate/it-kayali-translate.php'] ) ) { ikb_er_out( 'ERROR: plugin entry point missing' ); exit( 1 ); }
+    // This path deliberately never loads wp-config, WordPress, or SQL.
+    $tmp = IKB_ER_BACKUP_DIR . '/plugin-stage-' . bin2hex( random_bytes( 8 ) );
+    if ( ! mkdir( $tmp, 0700 ) ) { ikb_er_out( 'ERROR: cannot stage plugin rollback' ); exit( 1 ); }
+    $z = new ZipArchive();
+    if ( true !== $z->open( $zip_path ) || ! $z->extractTo( $tmp ) ) { ikb_er_out( 'ERROR: extraction failed; nothing replaced' ); exit( 1 ); }
+    $z->close();
+    $src = $tmp . '/wp-content/plugins/it-kayali-translate';
+    $dst = $wp_root . '/wp-content/plugins/it-kayali-translate';
+    $previous = IKB_ER_BACKUP_DIR . '/previous-translate-' . bin2hex( random_bytes( 8 ) );
+    if ( is_link( $dst ) || ! is_dir( $dst ) || ! rename( $dst, $previous ) ) { ikb_er_out( 'ERROR: could not retain current plugin; nothing replaced' ); exit( 1 ); }
+    if ( ! rename( $src, $dst ) ) {
+        $rolled_back = rename( $previous, $dst );
+        ikb_er_out( $rolled_back ? 'ERROR: swap failed; original plugin put back' : 'ERROR: swap failed; recover retained previous plugin directory' ); exit( 1 );
+    }
+    if ( function_exists( 'opcache_reset' ) ) { opcache_reset(); }
+    ikb_er_out( 'DONE: Translate plugin files restored. Database statements: 0. Current previous plugin files retained privately.' );
+    exit;
+}
 // --- Read wp-config.php for DB credentials --------------------------------
 $config_file = $wp_root . '/wp-config.php';
 if ( ! is_readable( $config_file ) ) {
@@ -269,8 +326,8 @@ function ikb_er_copy( $src, $dst ) {
 			if ( ! is_dir( dirname( $target ) ) ) {
 				mkdir( dirname( $target ), 0755, true );
 			}
-			copy( $file->getPathname(), $target );
-			$count++;
+			if ( ! copy( $file->getPathname(), $target ) ) { ikb_er_out( 'ERROR: file copy failed; restore incomplete' ); exit( 1 ); }
+            $count++;
 		}
 	}
 	return $count;

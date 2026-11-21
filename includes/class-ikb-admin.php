@@ -24,6 +24,7 @@ class IKB_Admin {
 		add_action( 'admin_post_ikb_delete', array( __CLASS__, 'handle_delete' ) );
 		add_action( 'admin_post_ikb_download', array( __CLASS__, 'handle_download' ) );
 		add_action( 'admin_post_ikb_deploy_emergency', array( __CLASS__, 'handle_deploy_emergency' ) );
+		add_action( 'admin_post_ikb_test_swap', array( __CLASS__, 'handle_test_swap' ) );
 		add_action( 'admin_post_ikb_settings', array( __CLASS__, 'handle_settings' ) );
 		add_action( 'admin_notices', array( __CLASS__, 'notice' ) );
 	}
@@ -76,7 +77,8 @@ class IKB_Admin {
 	public static function handle_create() {
 		self::guard( 'ikb_create' );
 		$backup = new IKB_Backup();
-		$result = $backup->create_backup();
+		$scope = isset( $_POST['scope'] ) && 'translate-plugin' === $_POST['scope'] ? 'translate-plugin' : 'full';
+        $result = $backup->create_backup( array( 'scope' => $scope ) );
 		if ( is_wp_error( $result ) ) {
 			self::back( 'error', $result->get_error_message() );
 		}
@@ -89,12 +91,20 @@ class IKB_Admin {
 	 */
 	public static function handle_restore() {
 		self::guard( 'ikb_restore' );
+        if ( 'RESTORE' !== ( $_POST['confirmation'] ?? '' ) ) { self::back( 'error', 'Typed RESTORE confirmation required. Nothing changed.' ); }
 		$file = isset( $_POST['backup_file'] ) ? sanitize_file_name( wp_unslash( $_POST['backup_file'] ) ) : '';
 		$path = ikb_backup_dir() . '/' . $file;
 		if ( '' === $file || 0 !== strpos( $file, 'ikb-backup-' ) || ! is_readable( $path ) ) {
 			self::back( 'error', 'Unknown backup file.' );
 		}
 		$restore = new IKB_Restore();
+        $m = IKB_Backup::read_manifest( $path );
+        if ( is_wp_error( $m ) ) { self::back( 'error', $m->get_error_message() ); }
+        if ( 'translate-plugin' === ( $m['scope'] ?? '' ) ) {
+            $result = $restore->restore_translate_plugin( $path );
+            if ( is_wp_error( $result ) ) { self::back( 'error', $result->get_error_message() ); }
+            self::back( 'restored', 'Translate plugin files rolled back; no database statements were run.' );
+        }
 		$result  = $restore->restore_backup(
 			$path,
 			array(
@@ -154,7 +164,7 @@ class IKB_Admin {
 		$token   = wp_generate_password( 32, false, false );
 		$script  = file_get_contents( $source ); // phpcs:ignore WordPress.WP.AlternativeFunctions
 		$script  = str_replace( '%%IKB_TOKEN%%', $token, $script );
-		$script  = str_replace( '%%IKB_BACKUP_DIR%%', ikb_backup_dir(), $script );
+		$script  = str_replace( "'%%IKB_BACKUP_DIR%%'", var_export( ikb_backup_dir(), true ), $script );
 
 		// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents
 		if ( false === file_put_contents( $target, $script ) ) {
@@ -164,6 +174,21 @@ class IKB_Admin {
 		update_option( 'ikb_emergency_deployed', array( 'path' => $target, 'token' => $token ) );
 		self::back( 'deployed', home_url( '/ikb-emergency-restore.php' ) . ' (token stored below)' );
 	}
+
+    /** Test the same directory-swap route using disposable marker directories only. */
+    public static function handle_test_swap() {
+        self::guard( 'ikb_test_swap' );
+        if ( ! ikb_storage_is_safe() ) { self::back( 'error', 'Storage safety check failed.' ); }
+        $id = wp_generate_password( 16, false, false );
+        $private = ikb_backup_dir() . '/swap-probe-' . $id;
+        $target = WP_CONTENT_DIR . '/plugins/.ikb-swap-probe-' . $id;
+        $ok = mkdir( $private, 0700 ) && false !== file_put_contents( $private . '/marker.txt', 'synthetic-probe-only' );
+        $ok = $ok && rename( $private, $target );
+        $ok = $ok && is_file( $target . '/marker.txt' ) && 'synthetic-probe-only' === file_get_contents( $target . '/marker.txt' );
+        $ok = $ok && rename( $target, $private );
+        foreach ( array( $private, $target ) as $dir ) { if ( is_file( $dir . '/marker.txt' ) ) { unlink( $dir . '/marker.txt' ); } if ( is_dir( $dir ) ) { rmdir( $dir ); } }
+        self::back( $ok ? 'probe_ok' : 'error', $ok ? 'Directory swap route verified using disposable marker directories. Live plugin and database were not changed.' : 'Directory swap probe failed. Do not rely on plugin rollback yet.' );
+    }
 
 	/**
 	 * Handle: settings (schedule, retention).
@@ -194,6 +219,7 @@ class IKB_Admin {
 			'deleted'        => 'Backup deleted',
 			'deployed'       => 'Emergency restore script deployed',
 			'settings_saved' => 'Settings saved',
+            'probe_ok' => 'Recovery route verified',
 			'error'          => 'Error',
 		);
 		$label = isset( $labels[ $msg ] ) ? $labels[ $msg ] : $msg;
@@ -244,7 +270,13 @@ class IKB_Admin {
 		submit_button( 'Create backup now', 'primary', 'submit', false );
 		echo '</form>';
 
-		// List.
+		echo '<p>Full backup excludes known backup archives/directories, caches and symlinks. It uses a 120-second work budget and publishes only after checksum verification. Very large sites may need a host backup. Automatic backups are off unless you enable them.</p>';
+        echo '<form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+        wp_nonce_field( 'ikb_create' );
+        echo '<input type="hidden" name="action" value="ikb_create"><input type="hidden" name="scope" value="translate-plugin">';
+        submit_button( 'Snapshot Translate plugin files only', 'secondary', 'submit', false );
+        echo '<p>Small, verified rollback snapshot. Contains only it-kayali-translate files. Restore never touches the database or orders.</p></form>';
+        // List.
 		echo '<h2>Backups (' . count( $backups ) . ')</h2>';
 		echo '<p><strong>Warning:</strong> restoring a backup overwrites the database, including orders and users created after the backup was taken. Use the safety backup option and restore promptly after an incident.</p>';
 		if ( empty( $backups ) ) {
@@ -252,6 +284,8 @@ class IKB_Admin {
 		} else {
 			echo '<table class="widefat striped"><thead><tr><th>File</th><th>Created (GMT)</th><th>Size</th><th>Actions</th></tr></thead><tbody>';
 			foreach ( $backups as $b ) {
+                $meta = IKB_Backup::read_manifest( $b['path'] );
+                $plugin_only = ! is_wp_error( $meta ) && 'translate-plugin' === ( $meta['scope'] ?? '' );
 				$download_url = wp_nonce_url(
 					admin_url( 'admin-post.php?action=ikb_download&backup_file=' . rawurlencode( $b['file'] ) ),
 					'ikb_download'
@@ -260,12 +294,14 @@ class IKB_Admin {
 
 				echo '<a class="button" href="' . esc_url( $download_url ) . '">Download</a> ';
 
-				echo '<form method="post" style="display:inline" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" onsubmit="return confirm(\'Restore this backup? The database will be OVERWRITTEN, including orders and users created after this backup.\')">';
+				echo '<strong>' . ( $plugin_only ? 'Translate files only, no DB' : 'Full backup' ) . '</strong> ';
+                echo '<form method="post" style="display:inline" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
 				wp_nonce_field( 'ikb_restore' );
 				echo '<input type="hidden" name="action" value="ikb_restore"><input type="hidden" name="backup_file" value="' . esc_attr( $b['file'] ) . '">';
-				echo '<label><input type="checkbox" name="safety_backup" value="1" checked> safety backup first</label> ';
-				echo '<label><input type="checkbox" name="keep_files" value="1"> database only</label> ';
-				submit_button( 'Restore', 'small', 'submit', false );
+				if ( ! $plugin_only ) { echo '<label><input type="checkbox" name="safety_backup" value="1" checked> safety backup first</label> '; }
+				if ( ! $plugin_only ) { echo '<label><input type="checkbox" name="keep_files" value="1"> database only</label> '; }
+				echo '<label>Type RESTORE <input name="confirmation" size="9" required pattern="RESTORE" autocomplete="off"></label> ';
+                submit_button( $plugin_only ? 'Roll back Translate files' : 'Restore full backup', 'small', 'submit', false );
 				echo '</form> ';
 
 				echo '<form method="post" style="display:inline" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '" onsubmit="return confirm(\'Delete this backup?\')">';
@@ -289,8 +325,14 @@ class IKB_Admin {
 		echo '</form>';
 		if ( ! empty( $deployed['path'] ) && file_exists( $deployed['path'] ) ) {
 			echo '<p>Currently deployed: <code>' . esc_html( home_url( '/ikb-emergency-restore.php' ) ) . '</code><br>';
-			echo 'Token: <code>' . esc_html( $deployed['token'] ) . '</code> (store this somewhere safe outside this site)</p>';
+			echo 'Token: <input type="password" readonly autocomplete="off" value="' . esc_attr( $deployed['token'] ) . '"> (keep this private; never send it in chat)</p>';
 		}
+
+        echo '<h2>Non-destructive recovery-route test</h2><form method="post" action="' . esc_url( admin_url( 'admin-post.php' ) ) . '">';
+        wp_nonce_field( 'ikb_test_swap' );
+        echo '<input type="hidden" name="action" value="ikb_test_swap">';
+        submit_button( 'Test plugin-directory swap route', 'secondary', 'submit', false );
+        echo '<p>Creates and removes disposable marker directories. Does not change the Translate plugin, database, orders or settings.</p></form>';
 
 		// Settings.
 		echo '<h2>Settings</h2>';

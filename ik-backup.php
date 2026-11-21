@@ -3,7 +3,7 @@
  * Plugin Name:       IK Backup
  * Plugin URI:        https://github.com/IT-Kayali/backup-plugin
  * Description:       Manual and scheduled full backups (database + wp-content) stored outside the web root, in-admin restore, and an emergency restore script that works when wp-admin is unreachable. This plugin does not replace hosting-level or off-server backups.
- * Version:           0.2.1
+ * Version:           0.3.0
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            IT-Kayali
@@ -16,7 +16,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'IKB_VERSION', '0.2.1' );
+define( 'IKB_VERSION', '0.3.0' );
 define( 'IKB_PLUGIN_FILE', __FILE__ );
 define( 'IKB_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 
@@ -106,7 +106,16 @@ function ikb_dir_is_public( $dir = null ) {
 	if ( ! $root || ! $real ) {
 		return true; // Unknown: assume public (fail closed).
 	}
-	return 0 === strpos( $real, rtrim( $root, '/' ) . '/' );
+	$roots = array( $root );
+    if ( ! empty( $_SERVER['DOCUMENT_ROOT'] ) ) {
+        $document_root = realpath( $_SERVER['DOCUMENT_ROOT'] );
+        if ( ! $document_root ) { return true; }
+        $roots[] = $document_root;
+    }
+    foreach ( $roots as $public_root ) {
+        if ( $real === $public_root || 0 === strpos( $real, rtrim( $public_root, '/' ) . '/' ) ) { return true; }
+    }
+    return false;
 }
 
 /**
@@ -136,7 +145,8 @@ function ikb_storage_probe_passes( $dir = null ) {
 	@file_put_contents( $dir . '/' . $probe, $secret );
 
 	$upload = wp_upload_dir();
-	$url    = str_replace( $upload['basedir'], $upload['baseurl'], $dir ) . '/' . $probe;
+	if ( 0 !== strpos( $dir, rtrim( $upload['basedir'], '/' ) . '/' ) ) { @unlink( $dir . '/' . $probe ); return false; }
+    $url    = str_replace( $upload['basedir'], $upload['baseurl'], $dir ) . '/' . $probe;
 
 	// Fail closed: only a verified denial counts. A definitive 401/403/404/410
 	// response without the probe body proves the file is not served. Anything
@@ -147,7 +157,7 @@ function ikb_storage_probe_passes( $dir = null ) {
 		$url,
 		array(
 			'timeout'     => 10,
-			'sslverify'   => false,
+			'sslverify'   => true,
 			'redirection' => 0,
 		)
 	);

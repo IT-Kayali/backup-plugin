@@ -22,6 +22,24 @@ class IKB_Restore {
 	 * @return array|WP_Error Restore stats.
 	 */
 	public function restore_backup( $zip_path, $args = array() ) {
+        $manifest = self::verify_archive( $zip_path );
+        if ( is_wp_error( $manifest ) ) { return $manifest; }
+        if ( 'translate-plugin' === ( $manifest['scope'] ?? '' ) ) { return $this->restore_translate_plugin( $zip_path ); }
+        if ( untrailingslashit( $manifest['site_url'] ?? '' ) !== untrailingslashit( home_url() ) ) { return new WP_Error( 'ikb_site', 'Restore is limited to this site.' ); }
+        $args = wp_parse_args( $args, array( 'safety_backup' => true, 'keep_files' => false ) );
+        if ( $args['safety_backup'] ) {
+            $safety = ( new IKB_Backup() )->create_backup( array( 'triggered_by' => 'prerestore' ) );
+            if ( is_wp_error( $safety ) ) { return $safety; }
+            $args['safety_backup'] = false;
+        }
+        $lock = fopen( ikb_backup_dir() . '/operation.lock', 'c' );
+        if ( ! $lock || ! flock( $lock, LOCK_EX | LOCK_NB ) ) { if ( $lock ) { fclose( $lock ); } return new WP_Error( 'ikb_busy', 'Another operation is running.' ); }
+        try { return $this->restore_full_locked( $zip_path, $args ); }
+        catch ( Throwable $e ) { return new WP_Error( 'ikb_restore_incomplete', 'Restore did not complete. Retain the backup and inspect the target before retrying.' ); }
+        finally { flock( $lock, LOCK_UN ); fclose( $lock ); }
+    }
+
+    private function restore_full_locked( $zip_path, $args = array() ) {
 		global $wpdb;
 
 		$args = wp_parse_args(
@@ -36,10 +54,9 @@ class IKB_Restore {
 			return new WP_Error( 'ikb_no_backup', 'Backup archive not found.' );
 		}
 
-		$manifest = IKB_Backup::read_manifest( $zip_path );
-		if ( is_wp_error( $manifest ) ) {
-			return $manifest;
-		}
+		$manifest = self::verify_archive( $zip_path );
+		if ( is_wp_error( $manifest ) ) { return $manifest; }
+        if ( 'translate-plugin' === ( $manifest['scope'] ?? '' ) ) { return $this->restore_translate_plugin( $zip_path ); }
 
 		$safe = self::validate_archive_paths( $zip_path );
 		if ( is_wp_error( $safe ) ) {
@@ -134,6 +151,66 @@ class IKB_Restore {
 		return $stats;
 	}
 
+    /** Verify all included files and the database before any mutation. */
+    public static function verify_archive( $path ) {
+        $safe = self::validate_archive_paths( $path );
+        if ( is_wp_error( $safe ) ) { return $safe; }
+        $m = IKB_Backup::read_manifest( $path );
+        if ( is_wp_error( $m ) ) { return $m; }
+        $scope = $m['scope'] ?? 'full';
+        if ( ! in_array( $scope, array( 'full', 'translate-plugin' ), true ) ) { return new WP_Error( 'ikb_scope', 'Unsupported backup scope.' ); }
+        if ( 'full' === $scope ) {
+            $db = self::verify_db_integrity( $path, $m );
+            if ( is_wp_error( $db ) ) { return $db; }
+        }
+        $zip = new ZipArchive();
+        if ( true !== $zip->open( $path, ZipArchive::CHECKCONS ) ) { return new WP_Error( 'ikb_zip', 'Archive consistency check failed.' ); }
+        $hashes = $m['file_sha256'] ?? array();
+        if ( empty( $hashes ) ) { $zip->close(); return new WP_Error( 'ikb_hashes', 'This archive lacks per-file checksums. Create a fresh verified backup.' ); }
+        for ( $i = 0; $i < $zip->numFiles; $i++ ) {
+            $name = $zip->getNameIndex( $i );
+            if ( 'manifest.json' === $name || ( 'full' === $scope && 'db.sql' === $name ) ) { continue; }
+            $prefix = 'translate-plugin' === $scope ? 'wp-content/plugins/it-kayali-translate/' : 'wp-content/';
+            if ( 0 !== strpos( $name, $prefix ) || ! isset( $hashes[$name] ) ) { $zip->close(); return new WP_Error( 'ikb_entry', 'Archive contains unexpected or unchecked files.' ); }
+        }
+        foreach ( $hashes as $name => $hash ) {
+            $stream = $zip->getStream( $name );
+            if ( ! $stream ) { $zip->close(); return new WP_Error( 'ikb_file_missing', 'An included backup file is missing.' ); }
+            $ctx = hash_init( 'sha256' ); hash_update_stream( $ctx, $stream ); fclose( $stream );
+            if ( ! is_string( $hash ) || ! hash_equals( $hash, hash_final( $ctx ) ) ) { $zip->close(); return new WP_Error( 'ikb_file_checksum', 'Backup file checksum mismatch. Nothing was changed.' ); }
+        }
+        $zip->close();
+        if ( 'translate-plugin' === $scope && ! isset( $hashes['wp-content/plugins/it-kayali-translate/it-kayali-translate.php'] ) ) { return new WP_Error( 'ikb_plugin_missing', 'Translate plugin entry point is missing.' ); }
+        return $m;
+    }
+
+    /** Replace only Translate plugin files. Never executes SQL or changes options. */
+    public function restore_translate_plugin( $path ) {
+        $lock = fopen( ikb_backup_dir() . '/operation.lock', 'c' );
+        if ( ! $lock || ! flock( $lock, LOCK_EX | LOCK_NB ) ) { if ( $lock ) { fclose( $lock ); } return new WP_Error( 'ikb_busy', 'Another operation is running.' ); }
+        $tmp = ikb_backup_dir() . '/plugin-restore-' . wp_generate_password( 12, false, false );
+        try {
+            $m = self::verify_archive( $path );
+            if ( is_wp_error( $m ) ) { return $m; }
+            if ( 'translate-plugin' !== ( $m['scope'] ?? '' ) || untrailingslashit( $m['site_url'] ?? '' ) !== untrailingslashit( home_url() ) ) { return new WP_Error( 'ikb_site', 'Only a Translate snapshot from this site may be used for plugin rollback.' ); }
+            if ( ! wp_mkdir_p( $tmp ) ) { return new WP_Error( 'ikb_tmp', 'Could not stage plugin rollback.' ); }
+            $z = new ZipArchive();
+            if ( true !== $z->open( $path ) || ! $z->extractTo( $tmp ) ) { $z->close(); return new WP_Error( 'ikb_extract', 'Could not stage plugin files.' ); }
+            $z->close();
+            $src = $tmp . '/wp-content/plugins/it-kayali-translate';
+            $dst = WP_CONTENT_DIR . '/plugins/it-kayali-translate';
+            $old = ikb_backup_dir() . '/previous-translate-' . wp_generate_password( 12, false, false );
+            if ( is_link( $dst ) || ! is_dir( $dst ) || ! rename( $dst, $old ) ) { return new WP_Error( 'ikb_move', 'Could not retain current plugin files. Nothing replaced.' ); }
+            if ( ! rename( $src, $dst ) ) {
+                if ( ! rename( $old, $dst ) ) { return new WP_Error( 'ikb_recovery', 'Plugin swap failed and needs manual recovery from the retained previous plugin directory.' ); }
+                return new WP_Error( 'ikb_swap', 'Plugin swap failed; original plugin was restored.' );
+            }
+            if ( function_exists( 'opcache_reset' ) ) { opcache_reset(); }
+            return array( 'files_restored' => count( $m['file_sha256'] ), 'db_statements' => 0 );
+        } catch ( Throwable $e ) { return new WP_Error( 'ikb_plugin_restore', 'Plugin rollback failed; inspect retained backup before retrying.' ); }
+        finally { $this->rmdir( $tmp ); flock( $lock, LOCK_UN ); fclose( $lock ); }
+    }
+
 	/**
 	 * Verify the database dump against the manifest checksum before anything
 	 * destructive happens.
@@ -147,20 +224,14 @@ class IKB_Restore {
 		if ( true !== $zip->open( $zip_path ) ) {
 			return new WP_Error( 'ikb_zip_read', 'Could not open backup archive.' );
 		}
-		$sql = $zip->getFromName( 'db.sql' );
-		$zip->close();
-		if ( ! is_string( $sql ) || '' === $sql ) {
-			return new WP_Error( 'ikb_no_sql', 'Backup archive has no db.sql.' );
-		}
-		if ( empty( $manifest['db_sha256'] ) ) {
-			return new WP_Error( 'ikb_no_checksum', 'Backup manifest has no database checksum; refusing to restore an unverified dump.' );
-		}
-		if ( ! hash_equals( (string) $manifest['db_sha256'], hash( 'sha256', $sql ) ) ) {
-			return new WP_Error( 'ikb_checksum_mismatch', 'Database dump checksum does not match the manifest; the archive is corrupt or tampered with. Restore aborted before any change.' );
-		}
-		if ( false === strpos( $sql, 'CREATE TABLE' ) ) {
-			return new WP_Error( 'ikb_bad_sql', 'Database dump contains no CREATE TABLE statements; refusing to restore.' );
-		}
+        $stream = $zip->getStream( 'db.sql' );
+        if ( ! $stream || empty( $manifest['db_sha256'] ) ) { $zip->close(); return new WP_Error( 'ikb_checksum', 'A database dump and checksum are required.' ); }
+        $ctx = hash_init( 'sha256' ); hash_update_stream( $ctx, $stream ); fclose( $stream );
+        $hash = hash_final( $ctx );
+        $stream = $zip->getStream( 'db.sql' ); $found = false;
+        while ( $stream && false !== ( $line = fgets( $stream ) ) ) { if ( 0 === strpos( $line, 'CREATE TABLE' ) ) { $found = true; break; } }
+        if ( $stream ) { fclose( $stream ); } $zip->close();
+        if ( ! $found || ! hash_equals( (string) $manifest['db_sha256'], $hash ) ) { return new WP_Error( 'ikb_checksum', 'Database checksum or schema validation failed. Nothing changed.' ); }
 		return true;
 	}
 
@@ -258,8 +329,8 @@ class IKB_Restore {
 					wp_mkdir_p( dirname( $target ) );
 				}
 				// phpcs:ignore WordPress.WP.AlternativeFunctions.copy_copy
-				copy( $file->getPathname(), $target );
-				$count++;
+				if ( ! copy( $file->getPathname(), $target ) ) { throw new RuntimeException( 'A restore file copy failed.' ); }
+                $count++;
 			}
 		}
 		return $count;
