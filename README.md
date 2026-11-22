@@ -55,7 +55,7 @@ This plugin is **not** a disaster-recovery guarantee:
 
 ## Compatibility
 
-- WordPress 6.0+, PHP 7.4+ (tested on WordPress 7.1.5, PHP 8.3, MariaDB 10.6)
+- WordPress 6.0+, PHP 7.4+ (tested on WordPress 7.1.5, PHP 8.1.2, MariaDB 10.6.23)
 - Requires the PHP ZipArchive extension
 - A writable directory outside the web root (available on most hosting) or a server that blocks direct access to the fallback uploads directory
 
@@ -65,6 +65,6 @@ GPL-2.0-or-later. Repository: https://github.com/IT-Kayali/backup-plugin
 
 ## Regression tests
 
-Run `php -d extension=zip tests/regressions.php` in an isolated directory with ZipArchive. The 24-assertion suite uses a synthetic WordPress adapter and real filesystem/ZIP operations, not a live database. It checks plugin snapshot/rollback, zero SQL, standalone recovery without WordPress, file tampering/traversal rejection, nested-backup exclusion, full archive checksums, DB read failure and locking. Final v0.3.1 was also tested on disposable real WordPress 7.1.5 / PHP 8.1.2 / MariaDB 10.6.23: 12 assertions cover admin/full and standalone/full restore, Unicode/empty binary SQL round-trip, deleted media recovery, and plugin-only rollback preserving a newer database marker. The HTTP emergency tests add 10 assertions, including verify-only, denied authentication/cross-origin requests and plugin-only restore. Target-specific non-destructive validation is still required.
+Run `php -d extension=zip tests/regressions.php` in an isolated directory with ZipArchive. The 24-assertion suite uses a synthetic WordPress adapter and real filesystem/ZIP operations, not a live database. It checks plugin snapshot/rollback, zero SQL, standalone recovery without WordPress, file tampering/traversal rejection, nested-backup exclusion, full archive checksums, DB read failure and locking. Final v0.3.1 was also tested on disposable real WordPress 7.1.5 / PHP 8.1.2 / MariaDB 10.6.23: 12 assertions cover admin/full and standalone/full restore, Unicode/empty binary SQL round-trip, deleted media recovery, and plugin-only rollback preserving a newer database marker. The HTTP emergency tests add 10 assertions, including verify-only, denied authentication/cross-origin requests and plugin-only restore. On 2026-11-22 v0.3.1 was additionally validated non-destructively on the production target: plugin installation and activation, full backup creation (nested archives/caches excluded), standalone verify-only HTTP check (access denied without the token, archive/checksum/writability checks passed with it) and a disposable directory-swap probe. No destructive restore of plugin files or the database was performed on the live site; a full live restore remains untested there by design.
 
 The admin recovery checks include a token-private HTTP verification button. It requires a definitive 403 without authentication and a successful standalone verify-only result for a Translate snapshot. Loopback/network errors are reported as inconclusive, never as success. No live restoration is performed by either recovery check.
